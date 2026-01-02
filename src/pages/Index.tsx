@@ -152,11 +152,11 @@ const Index = () => {
             <p className="mb-2">
               <strong>InnovAIte</strong> — The AI Innovation Engine
             </p>
-            <p className="text-sm mb-2">
+            <p className="text-sm mb-3">
               Powered by AI • Built with React & Lovable Cloud
             </p>
-            <p className="text-sm font-medium">
-              Built by team <strong>Code-Blooded</strong>
+            <p className="text-base font-semibold text-foreground">
+              Built by team <span className="text-primary">Code-Blooded</span>
             </p>
           </div>
         </div>
