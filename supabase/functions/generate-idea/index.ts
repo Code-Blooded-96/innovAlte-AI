@@ -8,6 +8,54 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Simple in-memory rate limiting (resets on function cold start)
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_MAX = 20; // max requests per window
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+function getRateLimitKey(req: Request): string {
+  // Use IP address or a combination of headers for rate limiting
+  const forwarded = req.headers.get('x-forwarded-for');
+  const realIp = req.headers.get('x-real-ip');
+  return forwarded?.split(',')[0]?.trim() || realIp || 'unknown';
+}
+
+function checkRateLimit(key: string): { allowed: boolean; remaining: number } {
+  const now = Date.now();
+  const record = rateLimitMap.get(key);
+  
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(key, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    return { allowed: true, remaining: RATE_LIMIT_MAX - 1 };
+  }
+  
+  if (record.count >= RATE_LIMIT_MAX) {
+    return { allowed: false, remaining: 0 };
+  }
+  
+  record.count++;
+  return { allowed: true, remaining: RATE_LIMIT_MAX - record.count };
+}
+
+// Input validation constants
+const MAX_REQUEST_SIZE = 10000; // 10KB max
+const MAX_STRING_LENGTH = 500;
+const MAX_IDEA_COUNT = 5;
+const MAX_DAYS = 365;
+const VALID_DIFFICULTIES = ['beginner', 'intermediate', 'advanced', 'easy', 'medium', 'hard'];
+const VALID_MODES = ['hackathon', 'startup', 'academic', 'beginner', 'personal', 'learning'];
+
+function sanitizeString(str: unknown): string {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[<>]/g, '').trim().slice(0, MAX_STRING_LENGTH);
+}
+
+function validateNumber(val: unknown, min: number, max: number, defaultVal: number): number {
+  const num = typeof val === 'number' ? val : parseInt(String(val), 10);
+  if (isNaN(num)) return defaultVal;
+  return Math.min(Math.max(num, min), max);
+}
+
 const SYSTEM_PROMPT = `You are InnovAIte Assistant, an expert startup/hackathon idea generator and AI Co-Founder. 
 
 For each user request, return ONLY valid JSON (no explanatory text before or after). Your JSON must have this exact structure:
@@ -61,30 +109,63 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // Rate limiting check
+  const rateLimitKey = getRateLimitKey(req);
+  const rateCheck = checkRateLimit(rateLimitKey);
+  
+  if (!rateCheck.allowed) {
+    console.log(`Rate limit exceeded for key: ${rateLimitKey}`);
+    return new Response(
+      JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }), 
+      { 
+        status: 429, 
+        headers: { 
+          ...corsHeaders, 
+          'Content-Type': 'application/json',
+          'Retry-After': '3600'
+        } 
+      }
+    );
+  }
+
   try {
-    const { 
-      domain, 
-      audience, 
-      difficulty, 
-      time_available_days, 
-      skills, 
-      mode, 
-      constraints,
-      multi_idea_count = 3 
-    } = await req.json();
+    // Check request size
+    const contentLength = req.headers.get('content-length');
+    if (contentLength && parseInt(contentLength, 10) > MAX_REQUEST_SIZE) {
+      return new Response(
+        JSON.stringify({ error: 'Request too large' }), 
+        { 
+          status: 413, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        }
+      );
+    }
+
+    const body = await req.json();
+    
+    // Validate and sanitize inputs
+    const domain = sanitizeString(body.domain);
+    const audience = sanitizeString(body.audience);
+    const difficulty = sanitizeString(body.difficulty);
+    const mode = sanitizeString(body.mode);
+    const skills = sanitizeString(body.skills);
+    const constraints = sanitizeString(body.constraints);
+    const time_available_days = validateNumber(body.time_available_days, 1, MAX_DAYS, 7);
+    const multi_idea_count = validateNumber(body.multi_idea_count, 1, MAX_IDEA_COUNT, 3);
 
     console.log('Generating ideas with params:', { 
       domain, 
       audience, 
       difficulty, 
       time_available_days, 
-      mode 
+      mode,
+      rateLimitRemaining: rateCheck.remaining
     });
 
     // Validate required fields
-    if (!domain || !audience || !difficulty || !time_available_days || !mode) {
+    if (!domain || !audience || !difficulty || !mode) {
       return new Response(
-        JSON.stringify({ error: 'Missing required fields: domain, audience, difficulty, time_available_days, mode' }), 
+        JSON.stringify({ error: 'Missing required fields: domain, audience, difficulty, mode' }), 
         { 
           status: 400, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -92,7 +173,28 @@ serve(async (req) => {
       );
     }
 
-    // Build user prompt
+    // Validate difficulty and mode values
+    if (!VALID_DIFFICULTIES.includes(difficulty.toLowerCase())) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid difficulty level' }), 
+        { 
+          status: 400, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        }
+      );
+    }
+
+    if (!VALID_MODES.includes(mode.toLowerCase())) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid mode' }), 
+        { 
+          status: 400, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        }
+      );
+    }
+
+    // Build user prompt with sanitized inputs
     const userPrompt = `Generate ${multi_idea_count} unique, buildable project ideas with these parameters:
 
 Domain: ${domain}
@@ -152,7 +254,7 @@ Requirements:
       }
       
       return new Response(
-        JSON.stringify({ error: `AI Gateway error: ${response.status}` }), 
+        JSON.stringify({ error: 'Service temporarily unavailable. Please try again.' }), 
         { 
           status: 500, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -163,7 +265,7 @@ Requirements:
     const data = await response.json();
     const generatedContent = data.choices[0].message.content;
     
-    console.log('Raw AI response:', generatedContent.substring(0, 200));
+    console.log('Raw AI response length:', generatedContent.length);
 
     // Parse the JSON response
     let parsedData;
@@ -185,7 +287,6 @@ Requirements:
       
     } catch (parseError) {
       console.error('JSON parsing error:', parseError);
-      console.error('Content that failed to parse:', generatedContent);
       
       // Attempt regex extraction as fallback
       const jsonMatch = generatedContent.match(/\{[\s\S]*\}/);
@@ -194,7 +295,7 @@ Requirements:
           parsedData = JSON.parse(jsonMatch[0]);
         } catch {
           return new Response(
-            JSON.stringify({ error: 'Failed to parse AI response. Please try again.' }), 
+            JSON.stringify({ error: 'Failed to process response. Please try again.' }), 
             { 
               status: 500, 
               headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -203,7 +304,7 @@ Requirements:
         }
       } else {
         return new Response(
-          JSON.stringify({ error: 'AI did not return valid JSON. Please try again.' }), 
+          JSON.stringify({ error: 'Failed to generate ideas. Please try again.' }), 
           { 
             status: 500, 
             headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -222,9 +323,7 @@ Requirements:
   } catch (error) {
     console.error('Error in generate-idea function:', error);
     return new Response(
-      JSON.stringify({ 
-        error: error instanceof Error ? error.message : 'Unknown error occurred' 
-      }), 
+      JSON.stringify({ error: 'An unexpected error occurred. Please try again.' }), 
       { 
         status: 500, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
